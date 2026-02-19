@@ -9,6 +9,8 @@
 - Lets you select one subscription from that filtered list.
 - Supports optional `-SubscriptionId` to skip interactive subscription selection.
 - Supports optional `-ForceLogin` to force a new interactive login and switch context.
+- Automatically retries Owner-role checks once with `Connect-AzAccount -AuthScope MicrosoftGraphEndpointResourceId` when Graph/MFA re-auth is required.
+- Supports optional `-SortOrder asc|desc` for month ordering in output.
 - Queries Cost Management data and aggregates totals per month.
 - Supports single year or year range input (`YYYY` or `YYYY:YYYY`).
 - Skips future years/months automatically.
@@ -43,6 +45,12 @@ Run for a range:
 
 ```powershell
 pwsh -File .\Get-AzureMonthlyCosts.ps1 -YearRange 2023:2026
+```
+
+Show newest months first:
+
+```powershell
+pwsh -File .\Get-AzureMonthlyCosts.ps1 -YearRange 2023:2026 -SortOrder desc
 ```
 
 Run for a specific subscription ID (no selection prompt):
@@ -84,6 +92,12 @@ pwsh -File .\Get-AzureMonthlyCosts.ps1 -YearRange 2024 -ForceLogin
 - Default: off (currency column hidden).
 - When enabled, output includes `Currency`.
 
+## `-SortOrder` Behavior
+
+- Optional parameter: `asc` or `desc`.
+- Default: `asc` (historical order: older months at top, newer months at bottom).
+- `desc` shows newest months first.
+
 ## `-CopyForExcel` Behavior
 
 - Optional switch.
@@ -97,6 +111,13 @@ pwsh -File .\Get-AzureMonthlyCosts.ps1 -YearRange 2024 -ForceLogin
 - Default: off (script tries to reuse existing Az context first).
 - When enabled, script always prompts interactive login (`Connect-AzAccount`).
 - Useful when you want to change account/tenant/subscription context explicitly.
+
+## Owner Role Check Authentication Notes
+
+- Owner filtering uses `Get-AzRoleAssignment`, which may require Microsoft Graph authentication.
+- If reused credentials are missing/expired for Graph, the script automatically retries once by prompting:
+  - `Connect-AzAccount -AuthScope MicrosoftGraphEndpointResourceId`
+- This is expected in tenants with Conditional Access or MFA requirements.
 
 ## `-YearRange` Format
 
