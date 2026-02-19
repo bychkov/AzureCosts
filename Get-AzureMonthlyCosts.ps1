@@ -1,6 +1,9 @@
 param(
     # Supported formats: YYYY or YYYY:YYYY. Default is current UTC year.
     [string]$YearRange = ([DateTime]::UtcNow.Year.ToString()),
+    # Month sort order for output: asc (historical) or desc (newest first).
+    [ValidateSet('asc', 'desc')]
+    [string]$SortOrder = 'asc',
     # Optional direct subscription selector. When provided, interactive selection is skipped.
     [string]$SubscriptionId,
     # Optional flag to include currency column in output. Off by default.
@@ -12,6 +15,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:OwnerRoleGraphReauthAttempted = $false
 
 # Ensures a required Az module exists, installs if missing, then imports it.
 function Require-Module {
@@ -158,6 +162,24 @@ function Parse-YearRange {
     }
 }
 
+# Returns true for Graph/MFA auth errors that can be fixed by re-login with AuthScope.
+function Test-IsGraphAuthScopeRequiredError {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    return (
+        $Message -match '(?i)MicrosoftGraphEndpointResourceId' -or
+        $Message -match '(?i)Authentication failed against resource' -or
+        $Message -match '(?i)Azure credentials have not been set up or have expired'
+    )
+}
+
 # Checks whether the signed-in principal has Owner role at subscription scope.
 function Test-OwnerAccessForSubscription {
     param(
@@ -171,23 +193,47 @@ function Test-OwnerAccessForSubscription {
     $accountType = [string]$Account.Type
     $accountId = [string]$Account.Id
 
-    if ($accountType -eq 'User') {
+    try {
+        if ($accountType -eq 'User') {
+            $assignments = @(Get-AzRoleAssignment -SignInName $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
+            return $assignments.Count -gt 0
+        }
+
+        if ($accountType -eq 'ServicePrincipal') {
+            $assignments = @(Get-AzRoleAssignment -ServicePrincipalName $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
+            return $assignments.Count -gt 0
+        }
+
+        if ($accountId -match '^[0-9a-fA-F-]{36}$') {
+            $assignments = @(Get-AzRoleAssignment -ObjectId $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
+            return $assignments.Count -gt 0
+        }
+
         $assignments = @(Get-AzRoleAssignment -SignInName $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
         return $assignments.Count -gt 0
     }
+    catch {
+        $message = [string]$_.Exception.Message
+        $shouldRetryWithGraphAuth = (
+            -not $script:OwnerRoleGraphReauthAttempted -and
+            (Test-IsGraphAuthScopeRequiredError -Message $message)
+        )
 
-    if ($accountType -eq 'ServicePrincipal') {
-        $assignments = @(Get-AzRoleAssignment -ServicePrincipalName $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
-        return $assignments.Count -gt 0
+        if ($shouldRetryWithGraphAuth) {
+            $script:OwnerRoleGraphReauthAttempted = $true
+            Write-Warning 'Owner role checks require refreshed Microsoft Graph authentication. Opening login...'
+            Connect-AzAccount -SkipContextPopulation -AuthScope MicrosoftGraphEndpointResourceId -ErrorAction Stop | Out-Null
+
+            $refreshedContext = Get-AzContext -ErrorAction SilentlyContinue
+            if ($null -ne $refreshedContext -and $null -ne $refreshedContext.Account) {
+                return Test-OwnerAccessForSubscription -SubscriptionId $SubscriptionId -Account $refreshedContext.Account
+            }
+
+            throw 'Graph authentication refresh succeeded but no active context is available.'
+        }
+
+        throw
     }
-
-    if ($accountId -match '^[0-9a-fA-F-]{36}$') {
-        $assignments = @(Get-AzRoleAssignment -ObjectId $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
-        return $assignments.Count -gt 0
-    }
-
-    $assignments = @(Get-AzRoleAssignment -SignInName $accountId -Scope $scope -RoleDefinitionName 'Owner' -ErrorAction Stop)
-    return $assignments.Count -gt 0
 }
 
 # Queries Cost Management for a time window, then aggregates daily rows to monthly totals.
@@ -582,6 +628,14 @@ foreach ($monthStart in $monthStarts) {
         Cost = $cost
         Currency = $currency
     }
+}
+
+# Apply requested month sort order for output/export.
+if ($SortOrder -eq 'desc') {
+    $rows = @($rows | Sort-Object Month -Descending)
+}
+else {
+    $rows = @($rows | Sort-Object Month)
 }
 
 # Summary and guard for empty activity.
