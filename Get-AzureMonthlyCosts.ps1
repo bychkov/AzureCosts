@@ -387,7 +387,7 @@ catch {
 
 if ($ForceLogin) {
     Write-Host 'ForceLogin enabled. Signing in to Azure...'
-    Connect-AzAccount -SkipContextPopulation -ErrorAction Stop | Out-Null
+    Connect-AzAccount -SkipContextPopulation -AuthScope MicrosoftGraphEndpointResourceId -ErrorAction Stop | Out-Null
 }
 else {
     try {
