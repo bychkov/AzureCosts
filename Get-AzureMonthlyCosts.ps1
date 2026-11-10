@@ -87,6 +87,63 @@ function Get-ApiErrorMessage {
     return 'Unexpected API response.'
 }
 
+# Reads the server-supplied backoff hint from a throttled/erroring REST response.
+# Cost Management returns 'Retry-After' (seconds) and/or 'x-ms-retry-after-ms' headers.
+# Invoke-AzRestMethod exposes headers as System.Net.Http.Headers.HttpResponseHeaders,
+# where Retry-After is a strongly-typed property that is NOT always visible via plain
+# Key/Value enumeration, so check both the typed property and the raw header list.
+# Returns 0 when no usable hint is present.
+function Get-RetryAfterSeconds {
+    param(
+        [Parameter(Mandatory = $false)]
+        $Response
+    )
+
+    if ($null -eq $Response -or $null -eq $Response.Headers) {
+        return 0
+    }
+
+    $headers = $Response.Headers
+
+    # 1) Strongly-typed Retry-After (RetryConditionHeaderValue): may carry a delta or a date.
+    try {
+        $retryAfter = $headers.RetryAfter
+        if ($null -ne $retryAfter) {
+            if ($null -ne $retryAfter.Delta) {
+                $seconds = [int][Math]::Ceiling(([TimeSpan]$retryAfter.Delta).TotalSeconds)
+                if ($seconds -gt 0) { return $seconds }
+            }
+            if ($null -ne $retryAfter.Date) {
+                $seconds = [int][Math]::Ceiling((([DateTimeOffset]$retryAfter.Date) - [DateTimeOffset]::UtcNow).TotalSeconds)
+                if ($seconds -gt 0) { return $seconds }
+            }
+        }
+    }
+    catch {
+    }
+
+    # 2) Fall back to scanning the raw header collection by name.
+    try {
+        foreach ($header in $headers) {
+            $key = [string]$header.Key
+            $value = [string]($header.Value | Select-Object -First 1)
+            $parsed = 0
+
+            if ($key -ieq 'Retry-After' -and [int]::TryParse($value, [ref]$parsed) -and $parsed -gt 0) {
+                return $parsed
+            }
+
+            if ($key -ieq 'x-ms-retry-after-ms' -and [int]::TryParse($value, [ref]$parsed) -and $parsed -gt 0) {
+                return [int][Math]::Ceiling($parsed / 1000.0)
+            }
+        }
+    }
+    catch {
+    }
+
+    return 0
+}
+
 # Finds the first matching column index by name in API response metadata.
 function Get-ColumnIndex {
     param(
@@ -257,7 +314,7 @@ function Get-BillingMonthTotals {
             to = $ToUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
         }
         dataset = @{
-            granularity = 'Daily'
+            granularity = 'Monthly'
             aggregation = @{
                 totalCost = @{
                     name = 'PreTaxCost'
@@ -269,36 +326,66 @@ function Get-BillingMonthTotals {
 
     $path = "/subscriptions/$SubscriptionId/providers/Microsoft.CostManagement/query?api-version=$apiVersion"
 
-    # Retry transient throttling/server errors with exponential backoff.
+    # Retry transient throttling/server errors with backoff.
+    # IMPORTANT: Invoke-AzRestMethod returns 429/5xx as a normal response (StatusCode set,
+    # no exception thrown), so throttling must be detected from the status code, not only
+    # from a thrown exception. When throttled, Cost Management sends a 'Retry-After' header
+    # telling us exactly how long to wait; honor it instead of guessing.
     $maxAttempts = 6
     $response = $null
 
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $statusCode = 0
+
         try {
             $response = Invoke-AzRestMethod -Method POST -Path $path -Payload $payload -ErrorAction Stop
-            break
+            $statusCode = [int]$response.StatusCode
         }
         catch {
+            # Network-level / pipeline failure with no response object to inspect.
             $message = [string]$_.Exception.Message
             $isThrottled = $message -match '(?i)\b429\b' -or $message -match '(?i)too many requests'
             $isServerError = $message -match '(?i)\b50[0-9]\b'
 
-            if ($isThrottled -and $attempt -lt $maxAttempts) {
-                $delaySeconds = 10
-                Write-Warning "HTTP 429 received (attempt $attempt/$maxAttempts). Retrying in $delaySeconds seconds..."
-                Start-Sleep -Seconds $delaySeconds
-                continue
-            }
-
-            if ($isServerError -and $attempt -lt $maxAttempts) {
-                $delaySeconds = [Math]::Min(60, [int][Math]::Pow(2, $attempt))
-                Write-Warning "Transient server error (attempt $attempt/$maxAttempts). Retrying in $delaySeconds seconds..."
+            if (($isThrottled -or $isServerError) -and $attempt -lt $maxAttempts) {
+                $delaySeconds = if ($isThrottled) { 30 } else { [Math]::Min(60, [int][Math]::Pow(2, $attempt)) }
+                Write-Warning "Transient error '$message' (attempt $attempt/$maxAttempts). Retrying in $delaySeconds seconds..."
                 Start-Sleep -Seconds $delaySeconds
                 continue
             }
 
             throw
         }
+
+        # Success: stop retrying and continue to parsing below.
+        if ($statusCode -ge 200 -and $statusCode -lt 300) {
+            break
+        }
+
+        # Throttled or transient server error returned as a response (no exception thrown).
+        $isThrottled = $statusCode -eq 429
+        $isServerError = $statusCode -ge 500 -and $statusCode -le 599
+
+        if (($isThrottled -or $isServerError) -and $attempt -lt $maxAttempts) {
+            $retryAfter = Get-RetryAfterSeconds -Response $response
+
+            if ($isThrottled) {
+                $delaySeconds = if ($retryAfter -gt 0) { $retryAfter } else { 30 * $attempt }
+                Write-Warning "HTTP 429 (too many requests) on attempt $attempt/$maxAttempts. Retrying in $delaySeconds seconds..."
+            }
+            else {
+                $delaySeconds = if ($retryAfter -gt 0) { $retryAfter } else { [Math]::Min(60, [int][Math]::Pow(2, $attempt)) }
+                Write-Warning "HTTP $statusCode on attempt $attempt/$maxAttempts. Retrying in $delaySeconds seconds..."
+            }
+
+            Start-Sleep -Seconds $delaySeconds
+            continue
+        }
+
+        # Non-retryable status, or attempts exhausted: surface the error.
+        $body = Parse-ResponseJson -Content $response.Content
+        $apiMessage = Get-ApiErrorMessage -Body $body
+        throw "HTTP $statusCode. $apiMessage"
     }
 
     if ($null -eq $response) {
@@ -559,7 +646,7 @@ $rangeStart = $monthStarts[0].ToString('yyyy-MM')
 $rangeEnd = $monthStarts[$monthStarts.Count - 1].ToString('yyyy-MM')
 $periodLabel = if ($startYear -eq $effectiveEndYear) { "calendar year $startYear" } else { "years ${startYear}:$effectiveEndYear" }
 
-Write-Host 'Data source: Cost Management Query (single yearly request; aggregated to month in script).'
+Write-Host 'Data source: Cost Management Query (one monthly-granularity request per year; API caps each query at 1 year).'
 if ($effectiveEndYear -lt $endYear) {
     Write-Host "Requested period: years ${startYear}:$endYear"
     Write-Host "Effective period (future years skipped): $periodLabel ($rangeStart to $rangeEnd)."
@@ -570,6 +657,9 @@ else {
 
 # Query one request per year in the effective range and merge results.
 try {
+    # The Cost Management Query API rejects any single query whose time range exceeds 1 year,
+    # so multi-year ranges must be split into per-calendar-year chunks (each <= 1 year).
+    # We keep monthly granularity so each chunk is a light request (12 rows, not ~365).
     $monthTotals = @{}
     $totalYears = $effectiveEndYear - $startYear + 1
 
